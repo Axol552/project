@@ -1,121 +1,94 @@
-const { Server } = require("socket.io");
-
-const PORT = process.env.PORT || 3000;
-const io = new Server(PORT, { cors: { origin: "*" } });
+const express = require('express');
+const app = express();
+const http = require('http').createServer(app);
+const io = require('socket.io')(http, {
+    cors: { origin: "*" }
+});
 
 let players = {};
-let trackWidth = 10;
-let spawnTimer = null;
-let isRoundActive = true;
-let spawnInterval = 1100; // Bazowy czas spawnu
-let roundTime = 0;
-let roundTimerInterval = null;
 
-console.log(`Serwer Cyber-Arena v2 działa na porcie ${PORT}...`);
+io.on('connection', (socket) => {
+    console.log(`Gracz połączony: ${socket.id}`);
 
-function serverSpawnLoop() {
-    if (!isRoundActive) return;
+    // Rejestracja nowego gracza na mapie (odradzanie w losowym miejscu)
+    players[socket.id] = {
+        id: socket.id,
+        name: "Rekrut",
+        x: Math.random() * 20 - 10,
+        y: 1.0, // Wysokość oczu gracza
+        z: Math.random() * 20 - 10,
+        rx: 0, ry: 0, // Rotacja myszki (góra/dół, lewo/prawo)
+        hp: 100,
+        frags: 0
+    };
 
-    if (Object.keys(players).length > 0) {
-        const xPos = (Math.random() - 0.5) * (trackWidth - 3);
-        const id = Math.random().toString(36).substring(2, 9);
-        
-        const rand = Math.random();
-        let type = 'crystal';
-        let isMoving = false;
+    // Wysyłamy nowemu graczowi listę obecnych, a innym info o nowym
+    socket.emit('init', { id: socket.id, players });
+    socket.broadcast.emit('playerJoined', players[socket.id]);
 
-        if (rand > 0.4) {
-            type = 'obstacle';
-            isMoving = Math.random() > 0.5;
-        } else if (rand < 0.1) {
-            type = 'shield';
-        } else if (rand >= 0.1 && rand < 0.2) {
-            type = 'nitro';
-        }
-
-        const height = type === 'obstacle' ? (Math.random() * 2 + 2) : 0;
-
-        io.emit("spawnObject", { id, type, xPos, height, isMoving });
-    }
-    
-    spawnTimer = setTimeout(serverSpawnLoop, spawnInterval);
-}
-serverSpawnLoop();
-
-function resetRound() {
-    clearTimeout(spawnTimer);
-    clearInterval(roundTimerInterval);
-    isRoundActive = false;
-    spawnInterval = 1100; // Reset czasu spawnu
-    roundTime = 0;
-    
-    setTimeout(() => {
-        isRoundActive = true;
-        io.emit("startNewRound");
-        startRoundTimer();
-        serverSpawnLoop();
-    }, 3000);
-}
-
-function startRoundTimer() {
-    roundTimerInterval = setInterval(() => {
-        if (!isRoundActive) return;
-        roundTime++;
-        
-        // 🚨 SUDDEN DEATH po 60 sekundach 🚨
-        if (roundTime === 60) {
-            spawnInterval = 500; // Spawn przeszkód dwa razy szybciej!
-            io.emit("suddenDeath");
-        }
-    }, 1000);
-}
-startRoundTimer();
-
-io.on("connection", (socket) => {
-    players[socket.id] = { x: 0, skin: 'default', score: 0, name: 'Anonim' };
-    socket.emit("currentPlayers", players);
-
-    socket.on("joinGame", (data) => {
-        if (players[socket.id]) {
-            players[socket.id].name = data.name || 'Gracz';
-            io.emit("leaderboardUpdate", players);
-            socket.broadcast.emit("newPlayer", { id: socket.id, playerInfo: players[socket.id] });
+    // Aktualizacja pozycji i rotacji z klienta
+    socket.on('updatePosition', (data) => {
+        if (players[socket.id] && players[socket.id].hp > 0) {
+            players[socket.id].x = data.x;
+            players[socket.id].y = data.y;
+            players[socket.id].z = data.z;
+            players[socket.id].rx = data.rx;
+            players[socket.id].ry = data.ry;
+            
+            // Rozsyłamy pozycję do reszty (oprócz nadawcy)
+            socket.broadcast.emit('playerMoved', players[socket.id]);
         }
     });
 
-    socket.on("playerMovement", (movementData) => {
-        if (players[socket.id]) {
-            players[socket.id].x = movementData.x;
-            socket.broadcast.emit("playerMoved", { id: socket.id, x: movementData.x });
-        }
-    });
+    // Logika strzału (Raycasting weryfikowany uproszczonym algorytmem na serwerze)
+    socket.on('shoot', (data) => {
+        if (!players[socket.id] || players[socket.id].hp <= 0) return;
 
-    // 💬 OBSŁUGA SZYBKIEGO CZATU 💬
-    socket.on("sendMessage", (text) => {
-        if (players[socket.id]) {
-            io.emit("chatMessage", { id: socket.id, text: text });
-        }
-    });
+        // Rozsyłamy efekt wizualny strzału do wszystkich
+        io.emit('visualShot', { shooterId: socket.id, targetPoint: data.targetPoint });
 
-    socket.on("playerDied", () => {
-        if (!isRoundActive) return;
-        Object.keys(players).forEach((id) => {
-            if (id !== socket.id) players[id].score += 1;
+        // Proste sprawdzanie trafienia na serwerze (hitbox jako odległość od linii strzału)
+        // W profesjonalnych grach używa się pełnego 3D raycastingu na serwerze, 
+        // tutaj robimy wersję zoptymalizowaną:
+        Object.keys(players).forEach(targetId => {
+            if (targetId === socket.id || players[targetId].hp <= 0) return;
+
+            let target = players[targetId];
+            // Obliczamy dystans od gracza do punktu, w który uderzył promień klienta
+            let distToHit = Math.hypot(target.x - data.targetPoint.x, target.z - data.targetPoint.z);
+            
+            // Jeśli punkt trafienia jest bardzo blisko pozycji wroga - mamy HIT!
+            if (distToHit < 1.5) { 
+                target.hp -= 35; // Trzy strzały do eliminacji
+                
+                if (target.hp <= 0) {
+                    players[socket.id].frags += 1;
+                    io.emit('playerKilled', { victimId: targetId, killerId: socket.id, killerFrags: players[socket.id].frags });
+                    
+                    // Odrodzenie (Respawn) po 3 sekundach
+                    setTimeout(() => {
+                        if (players[targetId]) {
+                            players[targetId].hp = 100;
+                            players[targetId].x = Math.random() * 20 - 10;
+                            players[targetId].z = Math.random() * 20 - 10;
+                            io.emit('playerRespawned', players[targetId]);
+                        }
+                    }, 3000);
+                } else {
+                    io.emit('playerHit', { id: targetId, hp: target.hp });
+                }
+            }
         });
-        io.emit("roundOver", { loserId: socket.id, playersStatus: players });
-        resetRound();
     });
 
-    socket.on("skinChanged", (skinName) => {
-        if (players[socket.id]) {
-            players[socket.id].skin = skinName;
-            socket.broadcast.emit("playerSkinChanged", { id: socket.id, skin: skinName });
-        }
-    });
-
-    socket.on("disconnect", () => {
+    socket.on('disconnect', () => {
+        console.log(`Gracz rozłączony: ${socket.id}`);
         delete players[socket.id];
-        io.emit("playerDisconnected", socket.id);
-        io.emit("leaderboardUpdate", players);
+        io.emit('playerLeft', socket.id);
     });
+});
+
+const PORT = process.env.PORT || 3000;
+http.listen(PORT, () => {
+    console.log(`Serwer FPS działa na porcie ${PORT}`);
 });
